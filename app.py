@@ -6,22 +6,20 @@ import numpy as np
 import plotly.graph_objs as go
 import ta
 import pandas_ta as pta
-from scipy.stats import linregress  # Import linregress
+from scipy.stats import linregress
 from streamlit_option_menu import option_menu
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, Column, Integer, String, Float, Date, ForeignKey
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, relationship
 from datetime import datetime, timedelta
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import train_test_split
 import hashlib
 import streamlit_authenticator as stauth
-
-
 import plotly.io as pio
-
 from scipy.fftpack import fft, ifft
 import pywt
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 import matplotlib.pyplot as plt
 from ta.trend import SMAIndicator, MACD, ADXIndicator
@@ -30,17 +28,31 @@ from ta.volatility import BollingerBands, AverageTrueRange
 import statsmodels.api as sm
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 
-
-
-
 # Set wide mode as default layout
 st.set_page_config(layout="wide", page_title="e-Trade")
 
+# Database setup
+DATABASE_URL = "sqlite:///etrade.db"
+Base = declarative_base()
 
+class User(Base):
+    __tablename__ = 'users'
+    id = Column(Integer, primary_key=True)
+    username = Column(String, unique=True, nullable=False)
+    password = Column(String, nullable=False)
 
-# In-memory user storage (for demo purposes)
-if 'users' not in st.session_state:
-    st.session_state.users = {}
+class Watchlist(Base):
+    __tablename__ = 'watchlists'
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=False)
+    ticker = Column(String, nullable=False)
+    date_added = Column(Date, default=datetime.utcnow)
+
+# Create a new database session
+engine = create_engine(DATABASE_URL)
+Base.metadata.create_all(engine)
+Session = sessionmaker(bind=engine)
+session = Session()
 
 # Initialize session state for login status
 if 'logged_in' not in st.session_state:
@@ -55,10 +67,12 @@ def signup():
     username = st.text_input("Enter a new username", key='signup_username')
     password = st.text_input("Enter a new password", type="password", key='signup_password')
     if st.button("Sign Up"):
-        if username in st.session_state.users:
+        if session.query(User).filter_by(username=username).first():
             st.error("Username already exists. Try a different username.")
         else:
-            st.session_state.users[username] = password
+            new_user = User(username=username, password=hashlib.sha256(password.encode()).hexdigest())
+            session.add(new_user)
+            session.commit()
             st.success("User registered successfully!")
 
 # Function to handle user login
@@ -67,7 +81,8 @@ def login():
     username = st.text_input("Enter your username", key='login_username')
     password = st.text_input("Enter your password", type="password", key='login_password')
     if st.button("Login"):
-        if st.session_state.users.get(username) == password:
+        user = session.query(User).filter_by(username=username, password=hashlib.sha256(password.encode()).hexdigest()).first()
+        if user:
             st.success("Login successful!")
             st.session_state.logged_in = True
             st.session_state.username = username
@@ -79,11 +94,10 @@ def logout():
     st.session_state.logged_in = False
     st.session_state.username = ""
 
-
 # Main menu after login
 def main_menu():
     st.subheader("Main Menu")
-    menu_options = ["Markets", "Stock Screener", "Technical Analysis", "Stock Price Forecasting", "Stock Watch","Strategy Backtesting","Watchlist"]
+    menu_options = ["Markets", "Stock Screener", "Technical Analysis", "Stock Price Forecasting", "Stock Watch", "Strategy Backtesting", "Watchlist", "My Portfolio"]
     choice = st.selectbox("Select an option", menu_options)
     return choice
 
@@ -105,73 +119,11 @@ with st.sidebar:
             signup()
         choice = None
 
-# Main content area---------------------------------------------------------------------------------------------------------------
+# Main content area
 if not st.session_state.logged_in:
     st.subheader("Please login or sign up to access the e-Trade platform.")
-
-    # Function to download data and calculate moving averages
-    def get_stock_data(ticker_symbol, start_date, end_date):
-        data = yf.download(ticker_symbol, start=start_date, end=end_date)
-        data['MA_15'] = data['Close'].rolling(window=15).mean()
-        data['MA_50'] = data['Close'].rolling(window=50).mean()
-        data.dropna(inplace=True)
-        return data
-
-    # Function to create Plotly figure
-    def create_figure(data, indicators, title):
-        fig = go.Figure()
-        if 'Close' in indicators:
-            fig.add_trace(go.Scatter(x=data.index, y=data['Close'], mode='lines', name='Close Price'))
-
-        if 'MA_15' in indicators:
-            fig.add_trace(go.Scatter(x=data.index, y=data['MA_15'], mode='lines', name='15-day MA'))
-
-        if 'MA_50' in indicators:
-            fig.add_trace(go.Scatter(x=data.index, y=data['MA_50'], mode='lines', name='50-day MA'))
-
-        fig.update_layout(title=title, xaxis_title='Date', yaxis_title='Price',
-                        xaxis_rangeslider_visible=True,
-                        plot_bgcolor='dark grey',
-                        paper_bgcolor='white',
-                        font=dict(color='black'),
-                        hovermode='x',
-                        xaxis=dict(rangeselector=dict(buttons=list([
-                            dict(count=1, label="1m", step="month", stepmode="backward"),
-                            dict(count=6, label="6m", step="month", stepmode="backward"),
-                            dict(count=1, label="YTD", step="year", stepmode="todate"),
-                            dict(count=1, label="1y", step="year", stepmode="backward"),
-                            dict(step="all")
-                        ])),
-                                    rangeslider=dict(visible=True),
-                                    type='date'),
-                        yaxis=dict(fixedrange=False),
-                        updatemenus=[dict(type="buttons",
-                                            buttons=[dict(label="Reset Zoom",
-                                                        method="relayout",
-                                                        args=[{"xaxis.range": [None, None],
-                                                                "yaxis.range": [None, None]}])])])
-        return fig
-    # Create two columns
-    col1, col2 = st.columns(2)
-
-    # Set up the start and end date inputs
-    with col1:
-        START = st.date_input('Start Date', pd.to_datetime("2015-01-01"))
-    with col2:
-        END = st.date_input('End Date', pd.to_datetime("today"))
-            
-    
-    
-    data_bse = get_stock_data("^BSESN", START, END)
-    indicators = st.multiselect("Select Indicators", ['Close', 'MA_15', 'MA_50'], default=['Close'])
-                
-    fig_bse = create_figure(data_bse, indicators, 'BSE Price')
-    st.plotly_chart(fig_bse)
-
-    
 else:
     if choice:
-        
         if choice == "Markets":
             st.subheader("Markets")
             with st.sidebar:
@@ -554,8 +506,8 @@ else:
                 # Load data and plot
                 load_data(selected_stock, START, END)   
 
+
         elif choice == "Technical Analysis":
-            
             st.sidebar.subheader("Interactive Charts")
             submenu = st.sidebar.radio("Select Option",["Trend Analysis", "Volume Analysis", "Support & Resistance Levels"] )
 
@@ -898,9 +850,8 @@ else:
                 else:
                     st.write("Not enough data points for technical analysis.")
 
-        
-        elif choice == "Stock Price Forecasting":
 
+        elif choice == "Stock Price Forecasting":
             # Step 2: Search box for stock ticker
             ticker = st.text_input('Enter Stock Ticker', 'AAPL')
 
@@ -1025,7 +976,6 @@ else:
             forecast_fig.add_trace(go.Scatter(x=forecast_labels, y=forecasted_values, mode='lines', name='Next 5 Days Forecast'))
             # Show the plot
             st.plotly_chart(forecast_fig)
-   
 
         elif choice == "Stock Watch":
         # Initialize session state
@@ -1060,7 +1010,6 @@ else:
                 st.error(f"An error occurred: {e}")
 
         elif choice == "Strategy Backtesting":
-
             # List of tickers
             tickers = ["ABBOTINDIA.NS", "ADANIPOWER.NS", "AFFLE.BO", "AIAENG.BO", "AJANTPHARM.BO", "APLLTD.BO", "ALKEM.BO", "ARE&M.NS", "ANANDRATHI.BO", 
                     "APARINDS.BO", "ASIANPAINT.NS", "ASTRAL.NS", "ASTRAZEN.NS", "BAJFINANCE.NS", "BASF.NS", "BAYERCROP.BO", "BERGEPAINT.BO", "BDL.NS", 
@@ -1351,8 +1300,23 @@ else:
             st.subheader('Strategy Performance')
             st.table(results_df)
 
-
         elif choice == "Watchlist":
+
+            st.header(f"{st.session_state.username}'s Watchlist")
+            user_id = session.query(User.id).filter_by(username=st.session_state.username).first()[0]
+            watchlist = session.query(Watchlist).filter_by(user_id=user_id).all()
+            
+            # Add new ticker to watchlist
+            new_ticker = st.text_input("Add a new ticker to your watchlist")
+            if st.button("Add Ticker", key="main_add_ticker"):
+                if not session.query(Watchlist).filter_by(user_id=user_id, ticker=new_ticker).first():
+                    new_watchlist_entry = Watchlist(user_id=user_id, ticker=new_ticker)
+                    session.add(new_watchlist_entry)
+                    session.commit()
+                    st.success(f"{new_ticker} added to your watchlist!")
+                else:
+                    st.warning(f"{new_ticker} is already in your watchlist.")
+
             # Initialize session state
             if 'watchlists' not in st.session_state:
                 st.session_state['watchlists'] = {f"Watchlist {i}": [] for i in range(1, 11)}
@@ -1395,9 +1359,9 @@ else:
 
             # Sidebar - Add ticker to selected watchlist
             st.sidebar.subheader("Add Ticker")
-            ticker_input = st.sidebar.text_input("Ticker Symbol (e.g., AAPL)")
+            ticker_input = st.sidebar.text_input("Ticker Symbol (e.g., AAPL)", key="sidebar_ticker_input")
 
-            if st.sidebar.button("Add Ticker"):
+            if st.sidebar.button("Add Ticker", key="sidebar_add_ticker"):
                 update_watchlist(selected_watchlist, ticker_input.upper())
                 st.sidebar.success(f"Ticker {ticker_input.upper()} added to {selected_watchlist}!")
 
@@ -1408,22 +1372,87 @@ else:
             if watchlist_tickers:
                 # Fetch data for all tickers in the watchlist
                 watchlist_data = {ticker: get_stock_data(ticker) for ticker in watchlist_tickers}
-                
+
                 # Convert the dictionary of series to a DataFrame
                 watchlist_df = pd.DataFrame(watchlist_data).T  # Transpose to have tickers as rows
                 st.write("Watchlist Data:")
                 st.dataframe(watchlist_df)
-                
+
                 # Provide option to remove tickers
                 st.subheader("Remove Ticker")
                 ticker_to_remove = st.selectbox("Select Ticker to Remove", watchlist_tickers)
-                if st.button("Remove Ticker"):
+                if st.button("Remove Ticker", key="remove_ticker"):
                     remove_from_watchlist(selected_watchlist, ticker_to_remove)
                     st.experimental_rerun()  # Refresh the app to reflect changes
             else:
                 st.write("No tickers in this watchlist.")
+        
+       
+        elif choice == "My Portfolio":
 
-            # Footer - Show all watchlists and their tickers
-            st.sidebar.subheader("All Watchlists")
-            for watchlist, tickers in st.session_state['watchlists'].items():
-                st.sidebar.write(f"{watchlist}: {', '.join(tickers) if tickers else 'No tickers'}")
+            # Function to get stock data
+            def get_stock_data(ticker):
+                stock = yf.Ticker(ticker)
+                data = stock.history(period="1d")
+                return data['Close'][0]
+
+            # Function to calculate portfolio value
+            def calculate_portfolio_value(portfolio):
+                total_value = 0
+                for stock, shares in portfolio.items():
+                    price = get_stock_data(stock)
+                    total_value += price * shares
+                return total_value
+
+            # Main function for the app
+            def main():
+                st.title("My Trading Portfolio")
+
+                # Portfolio dictionary
+                if 'portfolio' not in st.session_state:
+                    st.session_state.portfolio = {}
+
+                portfolio = st.session_state.portfolio
+
+                # Input fields to add a stock
+                st.header("Add a Stock to Your Portfolio")
+                new_stock = st.text_input("Stock Ticker", value="")
+                new_shares = st.number_input("Number of Shares", min_value=0, value=0, step=1)
+                
+                if st.button("Add Stock"):
+                    if new_stock and new_shares > 0:
+                        portfolio[new_stock] = portfolio.get(new_stock, 0) + new_shares
+                        st.session_state.portfolio = portfolio
+                        st.success(f"Added {new_shares} shares of {new_stock} to your portfolio.")
+
+                # Input fields to remove a stock
+                st.header("Remove a Stock from Your Portfolio")
+                remove_stock = st.text_input("Stock Ticker to Remove", value="")
+                remove_shares = st.number_input("Number of Shares to Remove", min_value=0, value=0, step=1)
+                
+                if st.button("Remove Stock"):
+                    if remove_stock in portfolio and remove_shares > 0:
+                        if portfolio[remove_stock] > remove_shares:
+                            portfolio[remove_stock] -= remove_shares
+                            st.success(f"Removed {remove_shares} shares of {remove_stock} from your portfolio.")
+                        elif portfolio[remove_stock] == remove_shares:
+                            del portfolio[remove_stock]
+                            st.success(f"Removed all shares of {remove_stock} from your portfolio.")
+                        else:
+                            st.error(f"You don't have enough shares of {remove_stock} to remove.")
+                        st.session_state.portfolio = portfolio
+
+                # Display the portfolio
+                st.header("Your Portfolio")
+                if portfolio:
+                    portfolio_df = pd.DataFrame(list(portfolio.items()), columns=['Stock', 'Shares'])
+                    st.table(portfolio_df)
+
+                    # Calculate and display the total portfolio value
+                    total_value = calculate_portfolio_value(portfolio)
+                    st.subheader(f"Total Portfolio Value: ${total_value:,.2f}")
+                else:
+                    st.write("Your portfolio is empty.")
+
+            if __name__ == "__main__":
+                main()
